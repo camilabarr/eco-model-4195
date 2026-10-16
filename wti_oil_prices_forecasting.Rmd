@@ -1,0 +1,239 @@
+---
+title: "Crude Oil WTI Prices Forecasting"
+author: "Camila Barragan"
+date: "2026-10-14"
+output: 
+  pdf_document:
+  toc: TRUE
+  number_sections: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(quantmod)
+library(bvartools)
+library(tseries)
+library(zoo)
+library(vars)
+library(lubridate)
+library(forecast)
+library(patchwork)
+library(tidyverse)
+library(bbk)
+library(dplyr)
+library(ggplot2)
+library(TTR)
+library(MLmetrics)
+library(TTR)
+library(fDMA)
+library(tsDyn)
+library(BVAR)
+library(urca)
+```
+
+```{r}
+# Download WTI Crude Oil spot price series from FRED
+getSymbols("DCOILWTICO", src = "FRED", from="2024-01-01")
+
+#Remove NA values
+oil_data=na.omit(DCOILWTICO)
+
+#Data frame 
+oil_df=data.frame(
+  Date=as.Date(index(oil_data)),
+  Price=as.numeric(oil_data$DCOILWTICO)
+)
+
+tail(oil_df)
+```
+
+# DMA
+```{r, fig.width=14, fig.height=9}
+
+# -- explanatory variables
+
+# Extract Nominal Broad USD index 
+getSymbols("DTWEXBGS", src = "FRED", from = "2024-01-01")
+us_index=na.omit(DTWEXBGS)
+
+us_df=data.frame(
+  Date=as.Date(index(us_index)), 
+  Index=as.numeric(us_index$DTWEXBGS)
+)
+tail(us_df)
+
+#### Match rows by date
+merging_xts= merge(oil_df, us_df, join="inner")
+tail(merging_xts)
+
+
+#----- Need Data team to get the API keys for the following data:
+
+# Extract Inventory
+#inventory=read.csv("https://api.eia.gov/v2/petroleum/stoc/cu/data/?frequency=monthly&data[0]=value&start=2024-01&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=5000")
+set.seed(111)
+inventory=rnorm(n=length(merging_xts$Price), mean=434.5, sd=15.8)
+
+# Spare capacity 
+spare_capacity=rnorm(n=length(merging_xts$Price), mean=2.82, sd= 1.76)
+#--------------
+
+
+# ------ Exogenous variable/s ------------
+hormuz_tm=rnorm(n=length(merging_xts$Price), mean=20, sd=15)
+
+# -------- Let Y=oil prices ---------
+Y = merging_xts$Price
+
+# ------- Create matrix
+oil_matrix=matrix(c(merging_xts$Index, inventory, spare_capacity), ncol=3)
+colnames(oil_matrix)=c("USD index", "Oil Inventory", "Spare Capacity")
+
+
+#DMA
+oil_dma= fDMA(
+  y=Y, 
+  x=oil_matrix, 
+  alpha=0.99, 
+  lambda=0.90, 
+  initvar = 10
+)
+summary(oil_dma)
+
+real_dma=oil_dma$y
+predicted_dma=oil_dma$y.hat
+
+plot(real_dma, type="l", col="black") 
+lines(predicted_dma, col="steelblue", lwd=2)
+legend("topleft", 
+       legend = c("Real values", "Predicted values"), 
+       col=c("black", "steelblue"), 
+       lty=1)
+
+```
+
+# VECM
+```{r, fig.width=14, fig.height=9}
+vecm_matrix=matrix(c(Y, merging_xts$Index, inventory, spare_capacity), ncol=4)
+colnames(vecm_matrix)=c("Crude Oil Price in USD", "USD index", 
+                        "Oil Inventory", "Spare Capacity")
+head(vecm_matrix)
+
+lagselect=VARselect(vecm_matrix, lag.max = 30)
+lagselect$selection
+lagselect$criteria
+
+#K=5
+
+# ---- cointegration tests ----
+ctest1=ca.jo(vecm_matrix, type="trace", ecdet="const", K=5 )
+summary(ctest1)
+
+ctest1e=ca.jo(vecm_matrix, type="eigen", ecdet="const", K=5 )
+summary(ctest1)
+
+#cointegration detected, r=1
+
+
+# ---- VECM model ----
+library(tsDyn)
+ModelVECM1= VECM(vecm_matrix, 
+                 5, 
+                 r=1, 
+                 estim="2OLS")
+summary(ModelVECM1)
+
+vecm_fc=predict(ModelVECM1, n.ahead = 90)
+plot(vecm_fc, type="l")
+
+
+# Second VECM model taking into account oil flow disruptions
+
+ModelVECM2= VECM(vecm_matrix, 
+                 5, 
+                 r=1, 
+                 estim="2OLS", 
+                 exogen = matrix(hormuz_tm, ncol=1))
+summary(ModelVECM2)
+
+#adding millions of barrels going through the Strait of Hormuz scenarios
+hormuz_1=matrix(rnorm(n=180, mean=6, sd=1)) #current
+hormuz_2=matrix(rnorm(n=180, mean=20, sd=3)) #previous
+hormuz_3=matrix(rnorm(n=180, mean=1, sd=0.5)) #worst-case
+
+vecm_fc_1=predict(ModelVECM2, n.ahead = 180, exoPred = hormuz_1)
+vecm_fc_2=predict(ModelVECM2, n.ahead = 180, exoPred = hormuz_2)
+vecm_fc_3=predict(ModelVECM2, n.ahead = 180, exoPred = hormuz_3)
+
+# Combine predictions into a single plot
+matplot(
+  cbind(vecm_fc_1[, 1], vecm_fc_2[, 1], vecm_fc_3[, 1]),
+  type = "l", lty = 1, lwd=2, col = c("steelblue", "green2", "orange"),
+  xlab = "Forecast horizon (days)",
+  ylab = "Crude oil price",
+  main = "Oil Price Forecasts under different Strait 
+  of Hormuz Crude Oil Flow Scenarios"
+)
+
+legend(
+  "bottomleft",
+  legend = c("Current scenario: mean 6", "Best case scenario: mean 20", 
+             "Worst case scenario: mean 1"),
+  col = c("steelblue", "green2", "orange"), lty = 1
+)
+```
+
+# VECM to VAR
+```{r, fig.width=14, fig.height=10}
+## ------ Diagnostic Tests --------
+# ---- Transform VECM to VAR ----
+Model1VAR=vec2var(ctest1, r=1)
+Model1VAR
+
+var_fc=predict(Model1VAR, n.ahead = 90)
+plot(var_fc, type="l")
+
+# ---- Serial correlation ----
+serial1=serial.test(Model1VAR, lags.pt = 6, type="PT.asymptotic")
+serial1
+
+# ---- ARCH effects (clustered volatility) ----
+arch1=arch.test(Model1VAR, lags.single = 15, multivariate.only =TRUE)
+arch1
+
+# ---- Normality of residuals ----
+norm1=normality.test(Model1VAR, multivariate.only = TRUE)
+norm1
+```
+
+## IRF
+```{r, fig.width=14, fig.height=9}
+# ---- Impulse Response Functions -----
+library(vars)
+library(urca)
+wholthing=irf(Model1VAR, n.ahead=30)
+plot(wholthing)
+
+Indexirf= irf.vec2var(Model1VAR, impulse="USD.index", response="Crude.Oil.Price.in.USD", n.ahead = 30,  boot=TRUE)
+
+plot(Indexirf, main="Crude Oil Prices shock to a one-unit increase in the Nominal Broad USD Index")
+
+inventoryirf= irf(Model1VAR, impulse="Oil.Inventory", response="Crude.Oil.Price.in.USD", n.ahead = 30,  boot=TRUE)
+plot(inventoryirf, main="Crude Oil Prices shock to a one-unit increase in the Oil Inventory")
+
+spareirf=irf(Model1VAR, impulse="Spare.Capacity", response="Crude.Oil.Price.in.USD", n.ahead = 30,  boot=TRUE)
+plot(inventoryirf, main="Crude Oil Prices shock to a one-unit increase in Spare Capacity")
+
+invtospareirf=irf(Model1VAR, impulse="Spare.Capacity", response="Oil.Inventory", n.ahead = 30,  boot=TRUE)
+plot(invtospareirf, main="Oil Inventory shock to a one-unit increase the Spare Capacity")
+
+# ---- Variance decomposition ----
+
+FEVD1=fevd(Model1VAR, n.ahead=20)
+plot(FEVD1)
+
+```
+

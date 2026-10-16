@@ -9,22 +9,337 @@ output: pdf_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-## R Markdown
-
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
-
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
-
-```{r cars}
-summary(cars)
+```{r}
+library(quantmod)
+library(bvartools)
+library(tseries)
+library(zoo)
+library(vars)
+library(lubridate)
+library(forecast)
+library(patchwork)
+library(tidyverse)
+library(bbk)
+library(dplyr)
+library(ggplot2)
+library(TTR)
+library(MLmetrics)
+library(TTR)
+library(fDMA)
 ```
 
-## Including Plots
-
-You can also embed plots, for example:
-
-```{r pressure, echo=FALSE}
-plot(pressure)
+```{r}
+# Download WTI Crude Oil spot price series from FRED
+getSymbols("DCOILWTICO", src = "FRED")
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+```{r}
+# View the most recent prices
+tail(DCOILWTICO)
+
+#Remove NA values
+oil_data=na.omit(DCOILWTICO)
+
+#Data frame 
+oil_df=data.frame(
+  Date=as.Date(index(oil_data)),
+  Price=as.numeric(oil_data$DCOILWTICO)
+)
+
+#Choose a smaller subset with the most recent years 
+oil_df_sub=subset(oil_df, Date >= "2024-01-01" )
+
+#print the first six rows
+head(oil_df_sub)
+```
+
+# Data Visualization 
+```{r}
+#Plot
+plot(DCOILWTICO, main="Oil Prices", ylab="Price in USD", xlab="Date", theme="minimal")
+
+#Plot smaller subset
+plot(oil_df_sub, type="l", main="Oil Prices", ylab="Price in USD", xlab="Date")
+
+#Decomposition starting from Jan, 2024
+ts_oil=ts(oil_df_sub$Price, frequency=260)
+dec_ts=decompose(ts_oil)
+plot(dec_ts)
+
+#ACF and PACF
+acf(oil_df_sub$Price)
+pacf(oil_df_sub$Price)
+```
+
+
+# Forecasts
+## Method 1: SMA
+```{r}
+library(ggplot2)
+library(forecast)
+library(xts)
+
+n_oil=length(oil_df_sub$Price)
+
+oil_train=oil_df_sub$Price[1:floor(0.8*n_oil)]
+oil_test=oil_df_sub$Price[((floor(0.8*n_oil))+1):n_oil]
+
+oil_sma=SMA(oil_df_sub$Price, n=100)
+tail(oil_sma)
+
+#plot(as.ts(oil_train), type="l", col="grey", lwd=1.5)
+  #lines(as.ts(oil_sma), col = "steelblue", lwd=2)
+  
+autoplot(as.ts(oil_train)) + 
+  autolayer(as.ts(na.omit(oil_sma))) + 
+  theme_minimal()
+
+oil_sma_fc=forecast(na.exclude(oil_sma), h=length(na.exclude(oil_test)))
+
+autoplot(oil_sma_fc, ylab="Price of Oil in USD")
+
+autoplot(as.ts(oil_train)) +
+  autolayer(oil_sma_fc) +
+  theme_minimal()
+
+result = MAPE(y_pred = oil_sma_fc$mean, y_true = oil_test)*100
+
+result_mape = data.frame(
+  "Model" = "Simple Moving Average",
+  "MAPE" = round(result)
+)
+result_mape
+```
+
+## Method 2: Triple Exponential Smoothing 
+```{r}
+library(stats)
+
+oil_train=ts(oil_train, frequency=260)
+
+oil_triple_ex_add= HoltWinters(x = oil_train, seasonal = "additive")
+
+oil_triple_ex_mult= HoltWinters(x = oil_train, seasonal = "multiplicative")
+
+
+forecast_triple_ex_add <- forecast(oil_triple_ex_add, h = length(oil_test))
+autoplot(forecast_triple_ex_add)
+
+forecast_triple_ex_mult <- forecast(oil_triple_ex_mult, h = length(oil_test))
+autoplot(forecast_triple_ex_mult)
+
+
+# Calculate MAPE for each holts winters
+result_mult <- MAPE(y_pred = forecast_triple_ex_mult$mean, y_true = oil_test)*100
+result_add <- MAPE(y_pred = forecast_triple_ex_add$mean, y_true = oil_test)*100
+
+result_mult
+result_add
+
+# Binding result to compare with other modelling
+result <- data.frame(
+  "Model" = c("Holts Winter Additive", "Holts Winter Multiplicative"),
+  "MAPE" = c(round(result_add),round(result_mult))
+)
+result_mape <- rbind(result_mape, result)
+```
+
+## Method 3: ARIMA
+```{r}
+#ADF test
+adf.test(oil_df_sub$Price) 
+#p-value>0.01, not enough evidence to reject H0
+
+#ADF test differencing one time
+adf.test(diff(oil_df_sub$Price))
+
+#Auto Arima
+oil_a_arima=auto.arima(oil_train)
+summary(oil_a_arima) #ideal differencing is d=1
+
+#forecast
+forecast_a_arima = forecast(oil_a_arima, h = length(oil_test))
+autoplot(forecast_a_arima)
+
+
+result_arima <- MAPE(y_pred = forecast_a_arima$mean, y_true = oil_test)*100
+
+# Result of MAPE
+result_arima
+
+
+# Binding result to compare with other modelling
+result <- data.frame(
+  "Model" = c("ARIMA"),
+  "MAPE" = c(round(result_arima))
+)
+
+result_mape <- rbind(result_mape, result)
+```
+
+
+## Check for normality
+```{r}
+#SMA 
+shapiro.test(oil_sma_fc$residuals)
+
+#HW mult
+shapiro.test(forecast_triple_ex_mult$residuals)
+
+#HW add
+shapiro.test(forecast_triple_ex_add$residuals)
+
+#arima
+shapiro.test(forecast_a_arima$residuals)
+```
+Results indicate that residuals are not normally distribuited for all 4 models.
+
+## Check for autocorrelation
+```{r}
+#SMA 
+Box.test(oil_sma_fc$residuals)
+
+#HW mult
+Box.test(forecast_triple_ex_mult$residuals)
+
+#HW add
+Box.test(forecast_triple_ex_add$residuals)
+
+#arima
+Box.test(forecast_a_arima$residuals)
+```
+Results indicate all for 4 models have no-autocorrelation in the forecast errors.
+
+## Conclusion
+
+```{r}
+result_mape
+```
+Both the SMA and ARIMA models give optimal results. For simplicity, I would choose SMA. 
+
+# Adding indicators
+# DMA
+```{r}
+
+#explanatory variables
+
+# Extract Nominal Broad USD index 
+getSymbols("DTWEXBGS", src = "FRED", from = "2024-01-01", to="2026-09-30")
+tail(DTWEXBGS)
+us_index=na.omit(DTWEXBGS)
+
+length(na.omit(DTWEXBGS))
+length(oil_df_sub$Price)
+tail(oil_df_sub)
+
+# Extract Inventory
+#inventory=read.csv("https://api.eia.gov/v2/petroleum/stoc/cu/data/?frequency=monthly&data[0]=value&start=2024-01&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=5000")
+set.seed(111)
+inventory=rnorm(n=length(oil_df_sub$Price), mean=434.5, sd=15.8)
+
+# Spare capacity 
+spare_capacity=rnorm(n=length(oil_df_sub$Price), mean=2.82, sd= 1.76)
+
+
+#Let Y=oil prices
+Y=oil_df_sub$Price
+
+#Create matrix
+oil_matrix=matrix(c(as.ts(us_index$DTWEXBGS), inventory, spare_capacity), ncol=3)
+colnames(oil_matrix)=c("USD index", "Oil Inventory", "Spare Capacity")
+
+#DMA
+oil_dma= fDMA(
+  y=Y, 
+  x=oil_matrix, 
+  alpha=0.99, 
+  lambda=0.99, 
+  initvar = 0.2
+)
+
+oil_dma_fc=forecast(oil_dma, n=20)
+plot(oil_dma_fc)
+
+```
+# VECM
+```{r}
+vecm_matrix=matrix(c(Y, as.ts(us_index$DTWEXBGS), inventory, spare_capacity), ncol=4)
+colnames(vecm_matrix)=c("Crude Oil Price in USD", "USD index", 
+                        "Oil Inventory", "Spare Capacity")
+head(vecm_matrix)
+
+lagselect=VARselect(vecm_matrix, lag.max = 30)
+lagselect$selection
+lagselect$criteria
+
+#K=5
+
+#---cointegration tests
+ctest1=ca.jo(vecm_matrix, type="trace", ecdet="const", K=5 )
+summary(ctest1)
+
+ctest1e=ca.jo(vecm_matrix, type="eigen", ecdet="const", K=5 )
+summary(ctest1)
+
+#cointegration detected, r=1
+
+
+#___ VECM model
+library(tsDyn)
+ModelVECM1= VECM(vecm_matrix, 5, r=1, estim="2OLS")
+summary(ModelVECM1)
+
+# Diagnostic Tests
+#Transform VECM to VAR
+Model1VAR=vec2var(ctest1, r=1)
+Model1VAR
+# Serial correlation 
+serial1=serial.test(Model1VAR, lags.pt = 6, type="PT.asymptotic")
+serial1
+
+# ARCH effects (clustered volatility)
+arch1=arch.test(Model1VAR, lags.single = 15, multivariate.only =TRUE)
+arch1
+
+#Normality of residuals
+norm1=normality.test(Model1VAR, multivariate.only = TRUE)
+norm1
+
+# Impulse Response Functions 
+
+Indexirf= irf(Model1VAR, impulse="Crude.Oil.Price.in.USD", response="USD.index", n.ahead = 20,  boot=TRUE)
+plot(Indexirf, main="Crude Oil Prices shock to the Nominal Broad USD Index")
+
+inventoryirf= irf(Model1VAR, impulse="Crude.Oil.Price.in.USD", response="Oil.Inventory", n.ahead = 20,  boot=TRUE)
+plot(inventoryirf, main="Crude Oil Prices shock to the Oil Inventory")
+
+
+# Variance decomposition
+
+FEVD1=fevd(Model1VAR, n.ahead=20)
+plot(FEVD1)
+```
+
+
+
+```{r}
+#log transform
+log_oil=log(DCOILWTICO)
+
+#diff * 100(growth rate)
+diff_oil=100*diff(log_oil)
+
+plot(diff_oil, main="Oil Price - Growth Rate % Daily", theme="classic")
+```
+
+```{r}
+# Estimate VAR
+var_aic <- VAR(diff_oil, type = "const", lag.max = 8, ic = "AIC", season = 4)
+
+# Lag order suggested by AIC
+var_aic$p
+```
+
+
+
+
